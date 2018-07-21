@@ -80,7 +80,7 @@
 #include "binder_trace.h"
 
 static HLIST_HEAD(binder_deferred_list);
-static DEFINE_MUTEX(binder_deferred_lock);
+static DEFINE_SPINLOCK(binder_deferred_lock);
 
 static HLIST_HEAD(binder_devices);
 static HLIST_HEAD(binder_procs);
@@ -141,8 +141,7 @@ enum {
 	BINDER_DEBUG_PRIORITY_CAP           = 1U << 13,
 	BINDER_DEBUG_SPINLOCKS              = 1U << 14,
 };
-static uint32_t binder_debug_mask = BINDER_DEBUG_USER_ERROR |
-	BINDER_DEBUG_FAILED_TRANSACTION | BINDER_DEBUG_DEAD_TRANSACTION;
+static uint32_t binder_debug_mask = 0; // alex.naidis@paranoidandroid.co Disable debug mask
 module_param_named(debug_mask, binder_debug_mask, uint, S_IWUSR | S_IRUGO);
 
 static char *binder_devices_param = CONFIG_ANDROID_BINDER_DEVICES;
@@ -466,9 +465,8 @@ struct binder_ref {
 };
 
 enum binder_deferred_state {
-	BINDER_DEFERRED_PUT_FILES    = 0x01,
-	BINDER_DEFERRED_FLUSH        = 0x02,
-	BINDER_DEFERRED_RELEASE      = 0x04,
+	BINDER_DEFERRED_FLUSH        = 0x01,
+	BINDER_DEFERRED_RELEASE      = 0x02,
 };
 
 /**
@@ -504,8 +502,6 @@ struct binder_priority {
  * @pid                   PID of group_leader of process
  *                        (invariant after initialized)
  * @tsk                   task_struct for group_leader of process
- *                        (invariant after initialized)
- * @files                 files_struct for process
  *                        (invariant after initialized)
  * @deferred_work_node:   element for binder_deferred_list
  *                        (protected by binder_deferred_lock)
@@ -553,7 +549,6 @@ struct binder_proc {
 	struct list_head waiting_threads;
 	int pid;
 	struct task_struct *tsk;
-	struct files_struct *files;
 	struct hlist_node deferred_work_node;
 	int deferred_work;
 	bool is_dead;
@@ -902,22 +897,34 @@ static void binder_free_thread(struct binder_thread *thread);
 static void binder_free_proc(struct binder_proc *proc);
 static void binder_inc_node_tmpref_ilocked(struct binder_node *node);
 
+struct files_struct *binder_get_files_struct(struct binder_proc *proc)
+{
+	return get_files_struct(proc->tsk);
+}
+
 static int task_get_unused_fd_flags(struct binder_proc *proc, int flags)
 {
-	struct files_struct *files = proc->files;
+	struct files_struct *files;
 	unsigned long rlim_cur;
 	unsigned long irqs;
+	int ret;
 
+	files = binder_get_files_struct(proc);
 	if (files == NULL)
 		return -ESRCH;
 
-	if (!lock_task_sighand(proc->tsk, &irqs))
-		return -EMFILE;
+	if (!lock_task_sighand(proc->tsk, &irqs)) {
+		ret = -EMFILE;
+		goto err;
+	}
 
 	rlim_cur = task_rlimit(proc->tsk, RLIMIT_NOFILE);
 	unlock_task_sighand(proc->tsk, &irqs);
 
-	return __alloc_fd(files, 0, rlim_cur, flags);
+	ret = __alloc_fd(files, 0, rlim_cur, flags);
+err:
+	put_files_struct(files);
+	return ret;
 }
 
 /*
@@ -926,8 +933,12 @@ static int task_get_unused_fd_flags(struct binder_proc *proc, int flags)
 static void task_fd_install(
 	struct binder_proc *proc, unsigned int fd, struct file *file)
 {
-	if (proc->files)
-		__fd_install(proc->files, fd, file);
+	struct files_struct *files = binder_get_files_struct(proc);
+
+	if (files) {
+		__fd_install(files, fd, file);
+		put_files_struct(files);
+	}
 }
 
 /*
@@ -935,18 +946,20 @@ static void task_fd_install(
  */
 static long task_close_fd(struct binder_proc *proc, unsigned int fd)
 {
+	struct files_struct *files = binder_get_files_struct(proc);
 	int retval;
 
-	if (proc->files == NULL)
+	if (files == NULL)
 		return -ESRCH;
 
-	retval = __close_fd(proc->files, fd);
+	retval = __close_fd(files, fd);
 	/* can't restart close syscall because file table entry was cleared */
 	if (unlikely(retval == -ERESTARTSYS ||
 		     retval == -ERESTARTNOINTR ||
 		     retval == -ERESTARTNOHAND ||
 		     retval == -ERESTART_RESTARTBLOCK))
 		retval = -EINTR;
+	put_files_struct(files);
 
 	return retval;
 }
@@ -1014,7 +1027,7 @@ binder_select_thread_ilocked(struct binder_proc *proc)
 {
 	struct binder_thread *thread;
 
-	BUG_ON(!spin_is_locked(&proc->inner_lock));
+	assert_spin_locked(&proc->inner_lock);
 	thread = list_first_entry_or_null(&proc->waiting_threads,
 					  struct binder_thread,
 					  waiting_thread_node);
@@ -1045,7 +1058,7 @@ static void binder_wakeup_thread_ilocked(struct binder_proc *proc,
 					 struct binder_thread *thread,
 					 bool sync)
 {
-	BUG_ON(!spin_is_locked(&proc->inner_lock));
+	assert_spin_locked(&proc->inner_lock);
 
 	if (thread) {
 		if (sync)
@@ -1224,7 +1237,7 @@ static struct binder_node *binder_get_node_ilocked(struct binder_proc *proc,
 	struct rb_node *n = proc->nodes.rb_node;
 	struct binder_node *node;
 
-	BUG_ON(!spin_is_locked(&proc->inner_lock));
+	assert_spin_locked(&proc->inner_lock);
 
 	while (n) {
 		node = rb_entry(n, struct binder_node, rb_node);
@@ -1270,7 +1283,8 @@ static struct binder_node *binder_init_node_ilocked(
 	__u32 flags = fp ? fp->flags : 0;
 	s8 priority;
 
-	BUG_ON(!spin_is_locked(&proc->inner_lock));
+	assert_spin_locked(&proc->inner_lock);
+
 	while (*p) {
 
 		parent = *p;
@@ -1349,9 +1363,9 @@ static int binder_inc_node_nilocked(struct binder_node *node, int strong,
 {
 	struct binder_proc *proc = node->proc;
 
-	BUG_ON(!spin_is_locked(&node->lock));
+	assert_spin_locked(&node->lock);
 	if (proc)
-		BUG_ON(!spin_is_locked(&proc->inner_lock));
+		assert_spin_locked(&proc->inner_lock);
 	if (strong) {
 		if (internal) {
 			if (target_list == NULL &&
@@ -1403,9 +1417,9 @@ static bool binder_dec_node_nilocked(struct binder_node *node,
 {
 	struct binder_proc *proc = node->proc;
 
-	BUG_ON(!spin_is_locked(&node->lock));
+	assert_spin_locked(&node->lock);
 	if (proc)
-		BUG_ON(!spin_is_locked(&proc->inner_lock));
+		assert_spin_locked(&proc->inner_lock);
 	if (strong) {
 		if (internal)
 			node->internal_strong_refs--;
@@ -1929,7 +1943,7 @@ static void binder_pop_transaction_ilocked(struct binder_thread *target_thread,
 					   struct binder_transaction *t)
 {
 	BUG_ON(!target_thread);
-	BUG_ON(!spin_is_locked(&target_thread->proc->inner_lock));
+	assert_spin_locked(&target_thread->proc->inner_lock);
 	BUG_ON(target_thread->transaction_stack != t);
 	BUG_ON(target_thread->transaction_stack->from != target_thread);
 	target_thread->transaction_stack =
@@ -2480,7 +2494,6 @@ static int binder_translate_handle(struct flat_binder_object *fp,
 			     (u64)node->ptr);
 		binder_node_unlock(node);
 	} else {
-		int ret;
 		struct binder_ref_data dest_rdata;
 
 		binder_node_unlock(node);
@@ -3561,11 +3574,13 @@ static int binder_thread_write(struct binder_proc *proc,
 				BUG_ON(buf_node->proc != proc);
 				w = binder_dequeue_work_head_ilocked(
 						&buf_node->async_todo);
-				if (!w)
+				if (!w) {
 					buf_node->has_async_transaction = 0;
-				else
+				} else {
 					binder_enqueue_work_ilocked(
-							w, &thread->todo);
+							w, &proc->todo);
+					binder_wakeup_proc_ilocked(proc);
+				}
 				binder_node_inner_unlock(buf_node);
 			}
 			trace_binder_transaction_buffer_release(buffer);
@@ -3709,22 +3724,12 @@ static int binder_thread_write(struct binder_proc *proc,
 				ref->death = death;
 				if (ref->node->proc == NULL) {
 					ref->death->work.type = BINDER_WORK_DEAD_BINDER;
-					if (thread->looper &
-					    (BINDER_LOOPER_STATE_REGISTERED |
-					     BINDER_LOOPER_STATE_ENTERED))
-						binder_enqueue_work(
-							proc,
-							&ref->death->work,
-							&thread->todo);
-					else {
-						binder_inner_proc_lock(proc);
-						binder_enqueue_work_ilocked(
-							&ref->death->work,
-							&proc->todo);
-						binder_wakeup_proc_ilocked(
-							proc);
-						binder_inner_proc_unlock(proc);
-					}
+
+					binder_inner_proc_lock(proc);
+					binder_enqueue_work_ilocked(
+						&ref->death->work, &proc->todo);
+					binder_wakeup_proc_ilocked(proc);
+					binder_inner_proc_unlock(proc);
 				}
 			} else {
 				if (ref->death == NULL) {
@@ -3839,12 +3844,6 @@ static void binder_stat_br(struct binder_proc *proc,
 		atomic_inc(&proc->stats.br[_IOC_NR(cmd)]);
 		atomic_inc(&thread->stats.br[_IOC_NR(cmd)]);
 	}
-}
-
-static int binder_has_thread_work(struct binder_thread *thread)
-{
-	return !binder_worklist_empty(thread->proc, &thread->todo) ||
-		thread->looper_need_return;
 }
 
 static int binder_put_node_cmd(struct binder_proc *proc,
@@ -4470,6 +4469,8 @@ static unsigned int binder_poll(struct file *filp,
 	bool wait_for_proc_work;
 
 	thread = binder_get_thread(proc);
+	if (!thread)
+		return POLLERR;
 
 	binder_inner_proc_lock(thread->proc);
 	thread->looper |= BINDER_LOOPER_STATE_POLL;
@@ -4477,12 +4478,9 @@ static unsigned int binder_poll(struct file *filp,
 
 	binder_inner_proc_unlock(thread->proc);
 
-	if (binder_has_work(thread, wait_for_proc_work))
-		return POLLIN;
-
 	poll_wait(filp, &thread->wait, wait);
 
-	if (binder_has_thread_work(thread))
+	if (binder_has_work(thread, wait_for_proc_work))
 		return POLLIN;
 
 	return 0;
@@ -4636,6 +4634,8 @@ static long binder_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	/*pr_info("binder_ioctl: %d:%d %x %lx\n",
 			proc->pid, current->pid, cmd, arg);*/
 
+	binder_selftest_alloc(&proc->alloc);
+
 	trace_binder_ioctl(cmd, arg);
 
 	ret = wait_event_interruptible(binder_user_error_wait, binder_stop_on_user_error < 2);
@@ -4747,7 +4747,6 @@ static void binder_vma_close(struct vm_area_struct *vma)
 		     (vma->vm_end - vma->vm_start) / SZ_1K, vma->vm_flags,
 		     (unsigned long)pgprot_val(vma->vm_page_prot));
 	binder_alloc_vma_close(&proc->alloc);
-	binder_defer_work(proc, BINDER_DEFERRED_PUT_FILES);
 }
 
 static int binder_vm_fault(struct vm_area_struct *vma, struct vm_fault *vmf)
@@ -4789,10 +4788,8 @@ static int binder_mmap(struct file *filp, struct vm_area_struct *vma)
 	vma->vm_private_data = proc;
 
 	ret = binder_alloc_mmap_handler(&proc->alloc, vma);
-	if (ret)
-		return ret;
-	proc->files = get_files_struct(current);
-	return 0;
+
+	return ret;
 
 err_bad_arg:
 	pr_err("binder_mmap: %d %lx-%lx %s failed %d\n",
@@ -4971,8 +4968,6 @@ static void binder_deferred_release(struct binder_proc *proc)
 	struct rb_node *n;
 	int threads, nodes, incoming_refs, outgoing_refs, active_transactions;
 
-	BUG_ON(proc->files);
-
 	mutex_lock(&binder_procs_lock);
 	hlist_del(&proc->proc_node);
 	mutex_unlock(&binder_procs_lock);
@@ -5054,12 +5049,10 @@ static void binder_deferred_release(struct binder_proc *proc)
 static void binder_deferred_func(struct work_struct *work)
 {
 	struct binder_proc *proc;
-	struct files_struct *files;
-
 	int defer;
 
 	do {
-		mutex_lock(&binder_deferred_lock);
+		spin_lock(&binder_deferred_lock);
 		if (!hlist_empty(&binder_deferred_list)) {
 			proc = hlist_entry(binder_deferred_list.first,
 					struct binder_proc, deferred_work_node);
@@ -5070,23 +5063,13 @@ static void binder_deferred_func(struct work_struct *work)
 			proc = NULL;
 			defer = 0;
 		}
-		mutex_unlock(&binder_deferred_lock);
-
-		files = NULL;
-		if (defer & BINDER_DEFERRED_PUT_FILES) {
-			files = proc->files;
-			if (files)
-				proc->files = NULL;
-		}
+		spin_unlock(&binder_deferred_lock);
 
 		if (defer & BINDER_DEFERRED_FLUSH)
 			binder_deferred_flush(proc);
 
 		if (defer & BINDER_DEFERRED_RELEASE)
 			binder_deferred_release(proc); /* frees proc */
-
-		if (files)
-			put_files_struct(files);
 	} while (proc);
 }
 static DECLARE_WORK(binder_deferred_work, binder_deferred_func);
@@ -5094,14 +5077,14 @@ static DECLARE_WORK(binder_deferred_work, binder_deferred_func);
 static void
 binder_defer_work(struct binder_proc *proc, enum binder_deferred_state defer)
 {
-	mutex_lock(&binder_deferred_lock);
+	spin_lock(&binder_deferred_lock);
 	proc->deferred_work |= defer;
 	if (hlist_unhashed(&proc->deferred_work_node)) {
 		hlist_add_head(&proc->deferred_work_node,
 				&binder_deferred_list);
 		queue_work(binder_deferred_workqueue, &binder_deferred_work);
 	}
-	mutex_unlock(&binder_deferred_lock);
+	spin_unlock(&binder_deferred_lock);
 }
 
 static void print_binder_transaction_ilocked(struct seq_file *m,
@@ -5112,7 +5095,6 @@ static void print_binder_transaction_ilocked(struct seq_file *m,
 	struct binder_proc *to_proc;
 	struct binder_buffer *buffer = t->buffer;
 
-	WARN_ON(!spin_is_locked(&proc->inner_lock));
 	spin_lock(&t->lock);
 	to_proc = t->to_proc;
 	seq_printf(m,
@@ -5201,7 +5183,6 @@ static void print_binder_thread_ilocked(struct seq_file *m,
 	size_t start_pos = m->count;
 	size_t header_pos;
 
-	WARN_ON(!spin_is_locked(&thread->proc->inner_lock));
 	seq_printf(m, "  thread %d: l %02x need_return %d tr %d\n",
 			thread->pid, thread->looper,
 			thread->looper_need_return,
@@ -5238,10 +5219,6 @@ static void print_binder_node_nilocked(struct seq_file *m,
 	struct binder_work *w;
 	int count;
 
-	WARN_ON(!spin_is_locked(&node->lock));
-	if (node->proc)
-		WARN_ON(!spin_is_locked(&node->proc->inner_lock));
-
 	count = 0;
 	hlist_for_each_entry(ref, &node->refs, node_entry)
 		count++;
@@ -5268,7 +5245,6 @@ static void print_binder_node_nilocked(struct seq_file *m,
 static void print_binder_ref_olocked(struct seq_file *m,
 				     struct binder_ref *ref)
 {
-	WARN_ON(!spin_is_locked(&ref->proc->outer_lock));
 	binder_node_lock(ref->node);
 	seq_printf(m, "  ref %d: desc %d %snode %d s %d w %d d %pK\n",
 		   ref->data.debug_id, ref->data.desc,
