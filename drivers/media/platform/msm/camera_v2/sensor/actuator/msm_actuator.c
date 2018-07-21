@@ -1,4 +1,4 @@
-/* Copyright (c) 2011-2017, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2011-2018, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -641,6 +641,8 @@ static int32_t msm_actuator_move_focus(
 		a_ctrl->curr_step_pos, dest_step_pos, curr_lens_pos);
 
 	while (a_ctrl->curr_step_pos != dest_step_pos) {
+		if (a_ctrl->curr_region_index >= a_ctrl->region_size)
+			break;
 		step_boundary =
 			a_ctrl->region_params[a_ctrl->curr_region_index].
 			step_bound[dir];
@@ -832,6 +834,19 @@ static int32_t msm_actuator_park_lens(struct msm_actuator_ctrl_t *a_ctrl)
 		a_ctrl->park_lens.max_step = a_ctrl->max_code_size;
 
 	next_lens_pos = a_ctrl->step_position_table[a_ctrl->curr_step_pos];
+
+    /* MM-MC-FixCameraCloseOver10s-00+{ */
+    //DAC data size is 10 bits, value = 0~1024 
+    if ((next_lens_pos < 0)||(next_lens_pos > 1024))
+    {
+        int new_lens_pos = 0;
+        if (next_lens_pos > 1024)
+            new_lens_pos = 1024;
+        pr_err("Cam_%d: Change next_lens_pos from %d to %d \n", a_ctrl->cam_name, next_lens_pos, new_lens_pos);
+        next_lens_pos = new_lens_pos;
+    }
+    /* MM-MC-FixCameraCloseOver10s-00+} */
+
 	while (next_lens_pos) {
 		/* conditions which help to reduce park lens time */
 		if (next_lens_pos > (a_ctrl->park_lens.max_step *
